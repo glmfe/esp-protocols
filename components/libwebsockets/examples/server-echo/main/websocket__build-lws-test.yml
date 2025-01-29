@@ -1,0 +1,100 @@
+name: "libwebsocket: build/flash-lws"
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  build_websocket:
+    if: contains(github.event.pull_request.labels.*.name, 'websocket') || github.event_name == 'push'
+    name: Build
+    strategy:
+      matrix:
+        idf_ver: ["release-v5.0", "release-v5.1", "release-v5.2", "release-v5.3", "latest"]
+        test: [ { app: server_echo, path: "components/libwebsockets/examples/server-echo/main" } ]
+    runs-on: ubuntu-22.04
+    container: espressif/idf:${{ matrix.idf_ver }}
+    env:
+      TEST_DIR: ${{ matrix.test.path }}
+
+    steps:
+      - name: Checkout esp-protocols
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio websockets idf-build-apps
+
+      - name: Build ${{ matrix.test.app }} with IDF-${{ matrix.idf_ver }}
+        shell: bash
+        run: |
+          . ${IDF_PATH}/export.sh
+          python ./ci/build_apps.py ${TEST_DIR}
+          cd ${TEST_DIR}
+          for dir in `ls -d build_esp32_*`; do
+          $GITHUB_WORKSPACE/ci/clean_build_artifacts.sh `pwd`/$dir
+          zip -qur artifacts.zip $dir
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: websocket_bin_esp32_${{ matrix.idf_ver }}_${{ matrix.test.app }}
+          path: ${{ env.TEST_DIR }}/artifacts.zip
+          if-no-files-found: error
+
+  flash_websocket:
+    if: |
+      github.repository == 'espressif/esp-protocols' &&
+      ( contains(github.event.pull_request.labels.*.name, 'websocket') || github.event_name == 'push' )
+    name: Flash Firmware to ESP32
+    needs: build_websocket
+    strategy:
+      fail-fast: false
+      matrix:
+        idf_ver: ["release-v5.0", "release-v5.1", "release-v5.2", "release-v5.3", "latest"]
+        idf_target: ["esp32"]
+        test: [ { app: server_echo, path: "components/libwebsockets/examples/server-echo/main" } ]
+    runs-on:
+      - self-hosted
+      - ESP32-ETHERNET-KIT
+    env:
+      TEST_DIR: ${{ matrix.test.path }}
+      FLASH_BAUD: "115200"
+      ESP_PORT: "/dev/ttyUSB0"
+      ESP_BAUD: "460800"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: websocket_bin_esp32_${{ matrix.idf_ver }}_${{ matrix.test.app }}
+          path: ${{ env.TEST_DIR }}/ci/
+
+      - name: Install ESP-IDF and esptool
+        run: |
+          . $IDF_PATH/export.sh
+          pip install esptool
+
+      - name: Extract Firmware
+        working-directory: ${{ env.TEST_DIR }}/ci
+        run: |
+          unzip -o artifacts.zip
+          ls -lah
+
+      - name: Flash Firmware to ESP32
+        run: |
+          . $IDF_PATH/export.sh
+          esptool.py --chip esp32 --port $ESP_PORT --baud $ESP_BAUD write_flash -z 0x1000 build/bootloader.bin
+          esptool.py --chip esp32 --port $ESP_PORT --baud $ESP_BAUD write_flash 0x8000 build/partition-table.bin
+          esptool.py --chip esp32 --port $ESP_PORT --baud $ESP_BAUD write_flash 0x10000 build/firmware.bin
+
+      - name: Verify Flash Success
+        run: |
+          esptool.py --chip esp32 --port $ESP_PORT flash_id
