@@ -93,6 +93,9 @@ typedef struct {
     size_t                      client_cert_len;
     const char                  *client_key;
     size_t                      client_key_len;
+#if CONFIG_ESP_TLS_USE_DS_PERIPHERAL
+    void                        *client_ds_data;
+#endif
     bool                        use_global_ca_store;
     bool                        skip_cert_common_name_check;
     const char                  *cert_common_name;
@@ -234,9 +237,9 @@ static esp_err_t esp_websocket_client_abort_connection(esp_websocket_client_hand
     } else {
         client->reconnect_tick_ms = _tick_get_ms();
         ESP_LOGI(TAG, "Reconnect after %d ms", client->wait_timeout_ms);
-        client->error_handle.error_type = error_type;
         client->state = WEBSOCKET_STATE_WAIT_TIMEOUT;
     }
+    client->error_handle.error_type = error_type;
     esp_websocket_client_dispatch_event(client, WEBSOCKET_EVENT_DISCONNECTED, NULL, 0);
     return ESP_OK;
 }
@@ -446,6 +449,21 @@ static void destroy_and_free_resources(esp_websocket_client_handle_t client)
     client = NULL;
 }
 
+static esp_err_t stop_wait_task(esp_websocket_client_handle_t client)
+{
+    /* A running client cannot be stopped from the websocket task/event handler */
+    TaskHandle_t running_task = xTaskGetCurrentTaskHandle();
+    if (running_task == client->task_handle) {
+        ESP_LOGE(TAG, "Client cannot be stopped from websocket task");
+        return ESP_FAIL;
+    }
+
+    client->run = false;
+    xEventGroupWaitBits(client->status_bits, STOPPED_BIT, false, true, portMAX_DELAY);
+    client->state = WEBSOCKET_STATE_UNKNOW;
+    return ESP_OK;
+}
+
 static esp_err_t set_websocket_transport_optional_settings(esp_websocket_client_handle_t client, const char *scheme)
 {
     esp_transport_handle_t trans = esp_transport_list_get_transport(client->transport_list, scheme);
@@ -531,6 +549,10 @@ static esp_err_t esp_websocket_client_create_transport(esp_websocket_client_hand
             } else {
                 esp_transport_ssl_set_client_key_data_der(ssl, client->config->client_key, client->config->client_key_len);
             }
+#if CONFIG_ESP_TLS_USE_DS_PERIPHERAL
+        } else if (client->config->client_ds_data) {
+            esp_transport_ssl_set_ds_data(ssl, client->config->client_ds_data);
+#endif
         }
         if (client->config->crt_bundle_attach) {
 #ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
@@ -696,6 +718,9 @@ esp_websocket_client_handle_t esp_websocket_client_init(const esp_websocket_clie
     client->config->client_cert_len = config->client_cert_len;
     client->config->client_key = config->client_key;
     client->config->client_key_len = config->client_key_len;
+#if CONFIG_ESP_TLS_USE_DS_PERIPHERAL
+    client->config->client_ds_data = config->client_ds_data;
+#endif
     client->config->skip_cert_common_name_check = config->skip_cert_common_name_check;
     client->config->cert_common_name = config->cert_common_name;
     client->config->crt_bundle_attach = config->crt_bundle_attach;
@@ -744,6 +769,7 @@ esp_websocket_client_handle_t esp_websocket_client_init(const esp_websocket_clie
     ESP_WS_CLIENT_MEM_CHECK(TAG, client->status_bits, {
         goto _websocket_init_fail;
     });
+    xEventGroupSetBits(client->status_bits, STOPPED_BIT);
 
     client->buffer_size = buffer_size;
     return client;
@@ -758,9 +784,11 @@ esp_err_t esp_websocket_client_destroy(esp_websocket_client_handle_t client)
     if (client == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (client->run) {
-        esp_websocket_client_stop(client);
+
+    if (client->status_bits && (STOPPED_BIT & xEventGroupGetBits(client->status_bits)) == 0) {
+        stop_wait_task(client);
     }
+
     destroy_and_free_resources(client);
     return ESP_OK;
 }
@@ -1149,23 +1177,13 @@ esp_err_t esp_websocket_client_stop(esp_websocket_client_handle_t client)
     if (client == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!client->run) {
+
+    if (xEventGroupGetBits(client->status_bits) & STOPPED_BIT) {
         ESP_LOGW(TAG, "Client was not started");
         return ESP_FAIL;
     }
 
-    /* A running client cannot be stopped from the websocket task/event handler */
-    TaskHandle_t running_task = xTaskGetCurrentTaskHandle();
-    if (running_task == client->task_handle) {
-        ESP_LOGE(TAG, "Client cannot be stopped from websocket task");
-        return ESP_FAIL;
-    }
-
-
-    client->run = false;
-    xEventGroupWaitBits(client->status_bits, STOPPED_BIT, false, true, portMAX_DELAY);
-    client->state = WEBSOCKET_STATE_UNKNOW;
-    return ESP_OK;
+    return stop_wait_task(client);
 }
 
 static int esp_websocket_client_send_close(esp_websocket_client_handle_t client, int code, const char *additional_data, int total_len, TickType_t timeout)
